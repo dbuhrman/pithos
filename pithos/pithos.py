@@ -27,6 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from enum import Enum
+from mutagen.id3 import ID3,TRCK,TIT2,TALB,TPE1,APIC,TCON
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -61,6 +62,7 @@ except AttributeError:
     RESAMPLER_FILTER_MODE_FULL = 1
 
 ALBUM_ART_SIZE = 96
+ALBUM_ART_FULL_SIZE = 300
 TEXT_X_PADDING = 12
 
 FALLBACK_BLACK = Gdk.RGBA(red=0.0, green=0.0, blue=0.0, alpha=1.0)
@@ -77,6 +79,12 @@ style="fill:{bg}" /></g></svg>
 BACKGROUND_SVG = '''
 <svg><rect y="0" x="0" height="{px}" width="{px}" style="fill:{fg}" /></svg>
 '''
+
+def clean_name(s):
+    # for windows you can do this:
+    #valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
+    #return ''.join(c if c in valid_chars else '-' for c in s.strip())
+    return s.strip().replace("/","-")
 
 class PseudoGst(Enum):
     """Create aliases to Gst.State so that we can add our own BUFFERING Pseudo state"""
@@ -121,7 +129,8 @@ class CellRendererAlbumArt(Gtk.CellRenderer):
         return getattr(self, pspec.name)
     def do_render(self, ctx, widget, background_area, cell_area, flags):
         if self.pixbuf is not None:
-            Gdk.cairo_set_source_pixbuf(ctx, self.pixbuf, cell_area.x, cell_area.y)
+            gui_pixbuf=self.pixbuf.scale_simple(ALBUM_ART_SIZE,ALBUM_ART_SIZE,GdkPixbuf.InterpType.BILINEAR)# scaled down pixbuf
+            Gdk.cairo_set_source_pixbuf(ctx, gui_pixbuf, cell_area.x, cell_area.y)
             ctx.paint()
         else:
             Gdk.cairo_set_source_pixbuf(ctx, self.background, cell_area.x, cell_area.y)
@@ -311,20 +320,46 @@ class PithosWindow(Gtk.ApplicationWindow):
         audioresample.set_property("quality", RESAMPLER_QUALITY_MAX)
         audioresample.set_property("sinc-filter-mode", RESAMPLER_FILTER_MODE_FULL)
         audiosink = Gst.ElementFactory.make("autoaudiosink", "audiosink")
+        split = Gst.ElementFactory.make("tee")
+        qrep = Gst.ElementFactory.make("queue")
+        qfs = Gst.ElementFactory.make("queue")
+        enc = Gst.ElementFactory.make("lamemp3enc")
+        # constant bit rate
+        enc.set_property("cbr", True) # constant bitrate
+        enc.set_property("target", 1) # target bitrate, 0 to target quality and then bitrate does not mater
+        enc.set_property("bitrate", 192) # incoming stream is 128 bit AAC+, so we upconvert to 128 to get every bit out of ut. Could user 192 or even 224 for pandora one subsribers
+        enc.set_property("encoding-engine-quality",2) # 2 high quality. 0 fast, 1 standard
+        self.tag = Gst.ElementFactory.make("id3v2mux") #vorbistag
+        self.fs = Gst.ElementFactory.make("filesink")
+        self.fs.set_property("location", "dummy.file") # updated later on song start
+        self.fs.set_property("async", False)
         sinkbin = Gst.Bin()
+        sinkbin.add(split)
+        sinkbin.add(qrep)
         sinkbin.add(self.rgvolume)
         sinkbin.add(self.rglimiter)
         sinkbin.add(self.equalizer)
         sinkbin.add(audioconvert)
         sinkbin.add(audioresample)
         sinkbin.add(audiosink)
+        sinkbin.add(qfs)
+        sinkbin.add(enc)
+        sinkbin.add(self.tag)
+        sinkbin.add(self.fs)
 
+        split.link(qrep)
+        qrep.link(audiosink)
         self.rgvolume.link(self.rglimiter)
         self.rglimiter.link(self.equalizer)
         self.equalizer.link(audioconvert)
         audioconvert.link(audioresample)
         audioresample.link(audiosink)
+        split.link(qfs)
+        qfs.link(enc)
+        enc.link(self.tag)
+        self.tag.link(self.fs)
 
+        sinkbin.add_pad(Gst.GhostPad.new("split", split.get_static_pad("sink")))
         sinkbin.add_pad(Gst.GhostPad.new("sink", self.rgvolume.get_static_pad("sink")))
         self.player.set_property("audio-sink", sinkbin)
 
@@ -742,6 +777,12 @@ class PithosWindow(Gtk.ApplicationWindow):
             return self.next_song()
 
         logging.info("Starting song: index = %i"%(song_index))
+        # set output file
+        self.outfolder="%s/%s" % ("/home/dan/Music",self.current_station.name)
+        if not os.path.exists(self.outfolder):
+            os.makedirs(self.outfolder)
+        self.fs.set_property("location", "%s/%s - %s.partial" % (self.outfolder,clean_name(self.current_song.artist),clean_name(self.current_song.title)))
+
         song = self.current_song
         audioUrl = song.audioUrl
         os.environ['PULSE_PROP_media.title'] = song.title
@@ -767,6 +808,8 @@ class PithosWindow(Gtk.ApplicationWindow):
     @GtkTemplate.Callback
     def next_song(self, *ignore):
         if self.current_song_index is not None:
+            if self.fs.get_property("location") is not None and os.path.isfile(self.fs.get_property("location")):
+                os.remove(self.fs.get_property("location"))    # remove the partial file
             self.start_song(self.current_song_index + 1)
 
     def _set_player_state(self, target, change_gst_state=False):
@@ -818,6 +861,8 @@ class PithosWindow(Gtk.ApplicationWindow):
 
 
     def stop(self):
+        if self.fs.get_property("location") is not None and os.path.isfile(self.fs.get_property("location")):
+            os.remove(self.fs.get_property("location"))    # remove the partial file on station switch, app exit etc which causes the song to "stop" midstream
         prev = self.current_song
         if prev and prev.start_time:
             prev.finished = True
@@ -1081,6 +1126,22 @@ class PithosWindow(Gtk.ApplicationWindow):
 
     def on_gst_eos(self, bus, message):
         logging.info("EOS")
+        # move the partial into completed
+        newlocation = "%s/%s - %s.mp3" % (self.outfolder,clean_name(self.current_song.artist),clean_name(self.current_song.title))
+        os.rename(self.fs.get_property("location"),newlocation)
+        # add mp3 tags
+        f=ID3(newlocation)
+        f.add(TIT2(encoding=3, text=self.current_song.title))
+        f.add(TALB(encoding=3, text=self.current_song.album))
+        f.add(TPE1(encoding=3, text=self.current_song.artist))
+        f.add(TCON(encoding=3, text=self.current_station.name))
+        if self.current_song.art_pixbuf is not None:    # add the cover art
+            # convert pure pixelmap to jpeg through file export because python Gtk is missing buffered function implementations
+            self.current_song.art_pixbuf.savev(newlocation+".jpg", "jpeg", ["quality"], ["100"])
+            # get the file contents into the mp3 id2 tag v2.3/2.4 cover art
+            f.add(APIC(3,u"image/jpg",3,u"Cover art",open(newlocation+".jpg", 'rb').read())) # first 3 = mutagen.id3.Encoding.UTF8,  second 3 =mutagen.id3.PictureType.COVER_FRONT
+            os.remove(newlocation+".jpg")
+        f.save()
         self.next_song()
 
     def on_gst_plugin_installed(self, result, userdata):
